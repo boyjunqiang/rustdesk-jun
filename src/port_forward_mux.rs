@@ -409,7 +409,7 @@ pub async fn run_channel<R, W>(
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub use tunnel::{Claim, Tunnel};
+pub use tunnel::{Claim, Tunnel, TunnelHandle};
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 mod tunnel {
@@ -484,6 +484,8 @@ mod tunnel {
                 next_id: AtomicI32::new(1),
                 reported: Default::default(),
                 teardown: watch::channel(false).0,
+                remote_ports: Mutex::new(Vec::new()),
+                remote_meta: Mutex::new(String::new()),
             });
             let state = self.state.clone();
             // Publish before spawning: if the loop exits first and resets the
@@ -526,9 +528,30 @@ mod tunnel {
         /// Raised once, by `close_all`, for the channels its `clear` cannot
         /// reach: one parked on its local socket is not on the inbound queue.
         teardown: watch::Sender<bool>,
+        remote_ports: Mutex<Vec<u16>>,
+        remote_meta: Mutex<String>,
     }
 
     impl TunnelHandle {
+        pub fn is_closed(&self) -> bool {
+            self.sink.is_closed()
+        }
+
+        pub fn remote_ports(&self) -> Vec<u16> {
+            self.remote_ports.lock().unwrap().clone()
+        }
+
+        pub fn remote_meta(&self) -> String {
+            self.remote_meta.lock().unwrap().clone()
+        }
+
+        pub async fn probe_remote_ports(&self, probe_host: &str) -> ResultType<()> {
+            if self.sink.is_closed() {
+                hbb_common::bail!("port forward tunnel is gone");
+            }
+            let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+            self.sink.send_ordered(open_msg(id, probe_host, -1, 0)).await
+        }
         /// `open` leaves from inside the channel's own task, down the ordered
         /// data queue, ahead of the channel's first `data`. On the control
         /// queue it could be overtaken by that `data` whenever the tunnel loop
@@ -586,6 +609,22 @@ mod tunnel {
         pub(super) fn on_frame(&self, ch: PortForwardChannel) -> Option<String> {
             match ch.union {
                 Some(port_forward_channel::Union::Opened(o)) => {
+                    if !o.success && o.message.starts_with("__lan_ports__:") {
+                        if let Some(csv) = o.message.strip_prefix("__lan_ports__:") {
+                            let (ports_part, meta_part) = csv.split_once(';').unwrap_or((csv, ""));
+                            let ports: Vec<u16> = ports_part
+                                .split(',')
+                                .filter_map(|s| s.trim().parse::<u16>().ok())
+                                .filter(|&p| p > 0)
+                                .collect();
+                            *self.remote_ports.lock().unwrap() = ports;
+                            if !meta_part.is_empty() {
+                                *self.remote_meta.lock().unwrap() = meta_part.to_owned();
+                            }
+                        }
+                        self.channels.lock().unwrap().remove(&o.channel_id);
+                        return None;
+                    }
                     let refused = {
                         let mut channels = self.channels.lock().unwrap();
                         if o.success {
@@ -641,7 +680,41 @@ mod tunnel {
                     None
                 }
                 Some(port_forward_channel::Union::Open(o)) => {
-                    log::debug!("ignoring open for channel {} on the controller", o.channel_id);
+                    if o.port <= 0 || o.port > 65535 {
+                        return None;
+                    }
+                    let id = o.channel_id;
+                    let (inbound_tx, inbound_rx) = mpsc::unbounded_channel();
+                    let credit = Arc::new(SendCredit::new(effective_window(o.window)));
+                    let window = Arc::new(Mutex::new(RecvWindow::new(INITIAL_WINDOW)));
+                    {
+                        let mut channels = self.channels.lock().unwrap();
+                        if channels.len() >= MAX_CHANNELS || channels.contains_key(&id) {
+                            return None;
+                        }
+                        channels.insert(
+                            id,
+                            ChannelEntry {
+                                inbound: inbound_tx,
+                                credit: credit.clone(),
+                                window: window.clone(),
+                                opened: true,
+                            },
+                        );
+                    }
+                    let addr = format!("127.0.0.1:{}", o.port);
+                    let sink = self.sink.clone();
+                    let teardown = self.teardown.subscribe();
+                    tokio::spawn(crate::server::port_forward_mux::run_controlled_channel(
+                        id,
+                        addr,
+                        false,
+                        credit,
+                        window,
+                        inbound_rx,
+                        sink,
+                        teardown,
+                    ));
                     None
                 }
                 _ => None,

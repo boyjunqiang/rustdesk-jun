@@ -14,6 +14,8 @@ import '../../models/peer_model.dart';
 import '../../models/platform_model.dart';
 import '../../desktop/widgets/material_mod_popup_menu.dart' as mod_menu;
 import '../../desktop/widgets/popup_menu.dart';
+import 'dart:async';
+import 'dart:convert';
 import 'dart:math' as math;
 
 typedef PopupMenuEntryBuilder = Future<List<mod_menu.PopupMenuEntry<String>>>
@@ -233,6 +235,8 @@ class _PeerCardState extends State<_PeerCard>
                     ],
                   ).marginOnly(top: 2),
                 ),
+                if (!isPortrait && (isDesktop || isWebDesktop))
+                  _PeerLanBar(peer: peer, compact: true).marginOnly(right: 4),
                 isPortrait
                     ? checkBoxOrActionMorePortrait(peer)
                     : checkBoxOrActionMoreLandscape(peer, isTile: true),
@@ -358,6 +362,8 @@ class _PeerCardState extends State<_PeerCard>
                     ),
                   ),
                 ),
+                if (isDesktop || isWebDesktop)
+                  _PeerLanBar(peer: peer, compact: false),
                 Container(
                   color: Theme.of(context).colorScheme.background,
                   child: Row(
@@ -1578,4 +1584,523 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
       isViewCamera: isViewCamera,
       isTcpTunneling: isTcpTunneling,
       isRDP: isRDP);
+}
+
+class _PeerLanBar extends StatefulWidget {
+  final Peer peer;
+  final bool compact;
+
+  const _PeerLanBar({
+    required this.peer,
+    required this.compact,
+    Key? key,
+  }) : super(key: key);
+
+  @override
+  State<_PeerLanBar> createState() => _PeerLanBarState();
+}
+
+class _PeerLanBarState extends State<_PeerLanBar> {
+  String _ip = '';
+  bool _enabled = false;
+  String _status = 'off';
+  String _error = '';
+  bool _hasPassword = false;
+  int _remoteBuild = 0;
+  bool _remoteUpdating = false;
+  String _peerMode = 'unknown';
+  bool _promptingPassword = false;
+  Timer? _pollTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _syncState();
+    _pollTimer = Timer.periodic(const Duration(milliseconds: 1200), (_) {
+      _syncState();
+    });
+  }
+
+  @override
+  void didUpdateWidget(covariant _PeerLanBar oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.peer.id != widget.peer.id) {
+      _syncState();
+    }
+  }
+
+  @override
+  void dispose() {
+    _pollTimer?.cancel();
+    super.dispose();
+  }
+
+  String _effectivePeerMode(String rawMode, int remoteBuild) {
+    if (remoteBuild > 0 || rawMode == 'custom') {
+      return 'custom';
+    }
+    if (rawMode == 'legacy') {
+      return 'legacy';
+    }
+    final p = widget.peer.platform.toLowerCase();
+    if (p.contains('win') || p.contains('linux') || p.contains('android')) {
+      return 'legacy';
+    }
+    return 'unknown';
+  }
+
+  void _syncState() {
+    if (!mounted) return;
+    try {
+      final raw = bind.mainGetCommonSync(key: 'lan_mesh_peer:${widget.peer.id}');
+      if (raw.isEmpty) return;
+      final map = jsonDecode(raw) as Map<String, dynamic>;
+      final ip = (map['ip'] as String?) ?? '';
+      final enabled = (map['enabled'] as bool?) ?? false;
+      final status = (map['status'] as String?) ?? 'off';
+      final error = (map['error'] as String?) ?? '';
+      final hasPassword = (map['has_password'] as bool?) ?? false;
+      final remoteBuild = (map['remote_build'] as num?)?.toInt() ?? 0;
+      final remoteUpdating = (map['remote_updating'] as bool?) ?? false;
+      final rawPeerMode = (map['peer_mode'] as String?) ?? 'unknown';
+      final peerMode = _effectivePeerMode(rawPeerMode, remoteBuild);
+      if (ip != _ip ||
+          enabled != _enabled ||
+          status != _status ||
+          error != _error ||
+          hasPassword != _hasPassword ||
+          remoteBuild != _remoteBuild ||
+          remoteUpdating != _remoteUpdating ||
+          peerMode != _peerMode) {
+        setState(() {
+          _ip = ip;
+          _enabled = enabled;
+          _status = status;
+          _error = error;
+          _hasPassword = hasPassword;
+          _remoteBuild = remoteBuild;
+          _remoteUpdating = remoteUpdating;
+          _peerMode = peerMode;
+        });
+      }
+      if (status == 'need_password' && !_promptingPassword) {
+        _promptPasswordAndConnect();
+      }
+    } catch (_) {}
+  }
+
+  String? _resolveSharedPassword() {
+    if (widget.peer.password.isNotEmpty) {
+      return widget.peer.password;
+    }
+    return gFFI.abModel.getdefaultSharedPassword();
+  }
+
+  void _toggleLan() {
+    final nextEnable = !_enabled;
+    if (nextEnable) {
+      final sharedPwd = _resolveSharedPassword();
+      if (!_hasPassword && (sharedPwd == null || sharedPwd.isEmpty)) {
+        _promptPasswordAndConnect();
+        return;
+      }
+      setState(() {
+        _enabled = true;
+        _status = 'connecting';
+        _error = '';
+      });
+      bind.mainSetCommon(
+        key: 'lan_mesh_toggle',
+        value: jsonEncode({
+          'id': widget.peer.id,
+          'enable': true,
+          if (sharedPwd != null && sharedPwd.isNotEmpty)
+            'shared_password': sharedPwd,
+        }),
+      );
+    } else {
+      setState(() {
+        _enabled = false;
+        _status = 'off';
+        _error = '';
+      });
+      bind.mainSetCommon(
+        key: 'lan_mesh_toggle',
+        value: jsonEncode({
+          'id': widget.peer.id,
+          'enable': false,
+        }),
+      );
+    }
+  }
+
+  void _promptPasswordAndConnect() {
+    if (_promptingPassword || !mounted) return;
+    _promptingPassword = true;
+    final controller = TextEditingController();
+    gFFI.dialogManager.show((setDialogState, close, context) {
+      void submit() {
+        final pwd = controller.text.trim();
+        if (pwd.isEmpty) {
+          close();
+          _promptingPassword = false;
+          setState(() {
+            _enabled = false;
+            _status = 'off';
+          });
+          bind.mainSetCommon(
+            key: 'lan_mesh_toggle',
+            value: jsonEncode({
+              'id': widget.peer.id,
+              'enable': false,
+            }),
+          );
+          return;
+        }
+        close();
+        _promptingPassword = false;
+        setState(() {
+          _enabled = true;
+          _status = 'connecting';
+          _error = '';
+          _hasPassword = true;
+        });
+        bind.mainSetCommon(
+          key: 'lan_mesh_toggle',
+          value: jsonEncode({
+            'id': widget.peer.id,
+            'enable': true,
+            'password': pwd,
+          }),
+        );
+      }
+
+      return CustomAlertDialog(
+        title: Text('加入局域网 (LAN) - ${widget.peer.alias.isEmpty ? widget.peer.id : widget.peer.alias}'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '固定局域网 IP: $_ip\n请输入该电脑的连接密码（保存后下次点开关可直接秒连）：',
+              style: const TextStyle(fontSize: 12),
+            ).marginOnly(bottom: 10),
+            DialogTextField(
+              title: translate('Password'),
+              controller: controller,
+              obscureText: true,
+            ),
+          ],
+        ),
+        actions: [
+          dialogButton('Cancel', onPressed: () {
+            close();
+            _promptingPassword = false;
+            setState(() {
+              _enabled = false;
+              _status = 'off';
+            });
+            bind.mainSetCommon(
+              key: 'lan_mesh_toggle',
+              value: jsonEncode({
+                'id': widget.peer.id,
+                'enable': false,
+              }),
+            );
+          }, isOutline: true),
+          dialogButton('OK', onPressed: submit),
+        ],
+        onSubmit: submit,
+        onCancel: () {
+          close();
+          _promptingPassword = false;
+        },
+      );
+    });
+  }
+
+  void _copyIp() {
+    if (_ip.isEmpty) return;
+    Clipboard.setData(ClipboardData(text: _ip));
+    BotToast.showText(text: '已复制局域网 IP: $_ip');
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final bool isConnected = _enabled && _status == 'connected';
+    final bool isConnecting = _enabled && _status == 'connecting';
+    final bool isError = _enabled && (_status == 'error' || _status == 'need_password');
+    final bool isLegacy = _peerMode == 'legacy';
+    final bool isCustom = _peerMode == 'custom';
+
+    final Color activeThemeColor = isLegacy
+        ? const Color(0xFFF59E0B)
+        : const Color(0xFF22C55E);
+
+    final Color dotColor = isConnected
+        ? activeThemeColor
+        : isConnecting
+            ? const Color(0xFFF59E0B)
+            : isError
+                ? const Color(0xFFEF4444)
+                : (isLegacy
+                    ? const Color(0xFFF59E0B).withOpacity(0.55)
+                    : (isCustom
+                        ? const Color(0xFF22C55E).withOpacity(0.55)
+                        : Colors.grey));
+
+    final String modeDesc = isLegacy
+        ? '【非定制版 / 原版客户端】仅支持本机单向访问该设备常用端口（如 ssh $_ip），不支持双向局域网互访与自动热更新'
+        : isCustom
+            ? '【定制版客户端${_remoteBuild > 0 ? " #$_remoteBuild" : ""}】支持完整双向虚拟局域网互访与自动热更新'
+            : '【版本待检测】首次打开局域网开关后将自动识别对方是否为定制版';
+
+    final String tooltipText = isConnected
+        ? (isLegacy
+            ? '单向兼容代理已开启: $_ip\n$modeDesc'
+            : '已加入双向虚拟局域网: $_ip（点击 IP 复制，点击右侧开关断开）\n$modeDesc')
+        : isConnecting
+            ? '正在建立局域网隧道: $_ip...\n$modeDesc'
+            : isError
+                ? '局域网连接异常: ${_error.isEmpty ? "请检查网络或密码" : _error}\n$modeDesc'
+                : '固定局域网 IP: $_ip\n$modeDesc';
+
+    if (widget.compact) {
+      return GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onTap: () {},
+        onDoubleTap: () {},
+        child: Tooltip(
+          message: tooltipText,
+          child: Container(
+            height: 22,
+            padding: const EdgeInsets.symmetric(horizontal: 6),
+            decoration: BoxDecoration(
+              color: isConnected
+                  ? activeThemeColor.withOpacity(0.15)
+                  : isLegacy
+                      ? const Color(0xFFF59E0B).withOpacity(isDark ? 0.10 : 0.08)
+                      : (isDark ? Colors.white10 : Colors.black.withOpacity(0.06)),
+              borderRadius: BorderRadius.circular(11),
+              border: Border.all(
+                color: isConnected
+                    ? activeThemeColor.withOpacity(0.6)
+                    : isLegacy
+                        ? const Color(0xFFF59E0B).withOpacity(0.35)
+                        : Colors.transparent,
+                width: 1,
+              ),
+            ),
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                InkWell(
+                  onTap: _copyIp,
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Container(
+                        width: 6,
+                        height: 6,
+                        decoration: BoxDecoration(
+                          color: dotColor,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 4),
+                      Text(
+                        _ip.isEmpty ? 'LAN' : _ip,
+                        style: TextStyle(
+                          fontSize: 10,
+                          fontWeight: isConnected ? FontWeight.w600 : FontWeight.normal,
+                          color: isConnected
+                              ? activeThemeColor
+                              : Theme.of(context).textTheme.bodySmall?.color,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 4),
+                _buildModeBadge(isDark, compact: true),
+                const SizedBox(width: 4),
+                _buildMiniSwitch(isConnected, isConnecting, activeThemeColor),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
+
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: () {},
+      onDoubleTap: () {},
+      child: Tooltip(
+        message: tooltipText,
+        child: Container(
+          height: 24,
+          padding: const EdgeInsets.symmetric(horizontal: 8),
+          decoration: BoxDecoration(
+            color: isConnected
+                ? activeThemeColor.withOpacity(isDark ? 0.18 : 0.12)
+                : isLegacy
+                    ? const Color(0xFFF59E0B).withOpacity(isDark ? 0.10 : 0.08)
+                    : (isDark
+                        ? Colors.black.withOpacity(0.28)
+                        : Colors.grey.withOpacity(0.12)),
+            border: Border(
+              top: BorderSide(
+                color: isConnected
+                    ? activeThemeColor.withOpacity(0.45)
+                    : isLegacy
+                        ? const Color(0xFFF59E0B).withOpacity(0.35)
+                        : (isCustom
+                            ? const Color(0xFF22C55E).withOpacity(0.25)
+                            : Colors.transparent),
+                width: 1,
+              ),
+            ),
+          ),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Expanded(
+                child: InkWell(
+                  onTap: _copyIp,
+                  child: Row(
+                    children: [
+                      Container(
+                        width: 7,
+                        height: 7,
+                        decoration: BoxDecoration(
+                          color: dotColor,
+                          shape: BoxShape.circle,
+                        ),
+                      ),
+                      const SizedBox(width: 5),
+                      Flexible(
+                        child: Text(
+                          _remoteUpdating
+                              ? '$_ip · 更新中'
+                              : isConnecting
+                                  ? '$_ip...'
+                                  : _ip,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: isConnected ? FontWeight.w600 : FontWeight.w500,
+                            color: isConnected
+                                ? activeThemeColor
+                                : Theme.of(context)
+                                    .textTheme
+                                    .bodySmall
+                                    ?.color
+                                    ?.withOpacity(0.85),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(width: 3),
+                      Icon(
+                        Icons.copy_rounded,
+                        size: 10,
+                        color: Theme.of(context)
+                            .textTheme
+                            .bodySmall
+                            ?.color
+                            ?.withOpacity(0.45),
+                      ),
+                      const SizedBox(width: 5),
+                      _buildModeBadge(isDark, compact: false),
+                    ],
+                  ),
+                ),
+              ),
+              const SizedBox(width: 4),
+              _buildMiniSwitch(isConnected, isConnecting, activeThemeColor),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildModeBadge(bool isDark, {required bool compact}) {
+    final bool isLegacy = _peerMode == 'legacy';
+    final bool isCustom = _peerMode == 'custom';
+
+    final String label = isCustom
+        ? (_remoteBuild > 0 ? '定制#$_remoteBuild' : '定制版')
+        : isLegacy
+            ? '原版·单向'
+            : '待检测';
+
+    final Color fgColor = isCustom
+        ? const Color(0xFF16A34A)
+        : isLegacy
+            ? const Color(0xFFD97706)
+            : (isDark ? Colors.white54 : Colors.black45);
+
+    final Color bgColor = isCustom
+        ? const Color(0xFF22C55E).withOpacity(isDark ? 0.20 : 0.14)
+        : isLegacy
+            ? const Color(0xFFF59E0B).withOpacity(isDark ? 0.22 : 0.15)
+            : (isDark ? Colors.white10 : Colors.black.withOpacity(0.06));
+
+    final Color borderColor = isCustom
+        ? const Color(0xFF22C55E).withOpacity(0.45)
+        : isLegacy
+            ? const Color(0xFFF59E0B).withOpacity(0.50)
+            : Colors.transparent;
+
+    return Container(
+      padding: EdgeInsets.symmetric(horizontal: compact ? 4 : 5, vertical: 1),
+      decoration: BoxDecoration(
+        color: bgColor,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: borderColor, width: 0.8),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: compact ? 8.5 : 9.5,
+          height: 1.15,
+          fontWeight: FontWeight.w600,
+          color: fgColor,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildMiniSwitch(bool isConnected, bool isConnecting, Color activeThemeColor) {
+    final active = _enabled;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _toggleLan,
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 160),
+        width: 30,
+        height: 16,
+        padding: const EdgeInsets.all(2),
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          color: isConnected
+              ? activeThemeColor
+              : (active
+                  ? const Color(0xFFF59E0B)
+                  : Colors.grey.withOpacity(0.45)),
+        ),
+        alignment: active ? Alignment.centerRight : Alignment.centerLeft,
+        child: Container(
+          width: 12,
+          height: 12,
+          decoration: const BoxDecoration(
+            color: Colors.white,
+            shape: BoxShape.circle,
+          ),
+        ),
+      ),
+    );
+  }
 }

@@ -379,7 +379,7 @@ class MyTheme {
     appBarTheme: AppBarTheme(
       shadowColor: Colors.transparent,
     ),
-    dialogTheme: DialogTheme(
+    dialogTheme: DialogThemeData(
       elevation: 15,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(18.0),
@@ -410,7 +410,7 @@ class MyTheme {
     cardColor: grayBg,
     hintColor: Color(0xFFAAAAAA),
     visualDensity: VisualDensity.adaptivePlatformDensity,
-    tabBarTheme: const TabBarTheme(
+    tabBarTheme: const TabBarThemeData(
       labelColor: Colors.black87,
     ),
     tooltipTheme: tooltipTheme(),
@@ -477,7 +477,7 @@ class MyTheme {
     appBarTheme: AppBarTheme(
       shadowColor: Colors.transparent,
     ),
-    dialogTheme: DialogTheme(
+    dialogTheme: DialogThemeData(
       elevation: 15,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(18.0),
@@ -511,7 +511,7 @@ class MyTheme {
     ),
     cardColor: Color(0xFF24252B),
     visualDensity: VisualDensity.adaptivePlatformDensity,
-    tabBarTheme: const TabBarTheme(
+    tabBarTheme: const TabBarThemeData(
       labelColor: Colors.white70,
     ),
     tooltipTheme: tooltipTheme(),
@@ -1205,23 +1205,7 @@ void msgBox(SessionID sessionId, String type, String title, String text,
       dialogManager.dismissAll();
     }
 
-    dialogManager.show(
-      (setState, close, context) => CustomAlertDialog(
-        title: null,
-        content: SelectionArea(child: msgboxContent(type, title, text)),
-        actions: [
-          dialogButton(
-            'Continue',
-            onPressed: continueSession,
-            isOutline: true,
-          ),
-          dialogButton('Disconnect', onPressed: closeSession),
-        ],
-        onSubmit: closeSession,
-        onCancel: closeSession,
-      ),
-      tag: '$sessionId-$type-$title-$text-$link',
-    );
+    continueSession();
     return;
   }
 
@@ -2024,7 +2008,10 @@ Future<Offset?> _adjustRestoreMainWindowOffset(
 //
 // display is used to set the offset of the window in individual display mode.
 Future<bool> restoreWindowPosition(WindowType type,
-    {int? windowId, String? peerId, int? display}) async {
+    {int? windowId,
+    String? peerId,
+    int? display,
+    bool forceFullscreen = false}) async {
   if (bind
       .mainGetEnv(key: "DISABLE_RUSTDESK_RESTORE_WINDOW_POSITION")
       .isNotEmpty) {
@@ -2069,6 +2056,16 @@ Future<bool> restoreWindowPosition(WindowType type,
         // No need to change the position of a sub window if no position is saved,
         // since the default position is already centered.
         // https://github.com/rustdesk/rustdesk/blob/317639169359936f7f9f85ef445ec9774218772d/flutter/lib/utils/multi_window_manager.dart#L163
+        if (forceFullscreen && windowId != null) {
+          Future.delayed(Duration(milliseconds: 300), () async {
+            if (kWindowId == windowId) {
+              stateGlobal.setFullscreen(true);
+            } else {
+              DesktopMultiWindow.invokeMethod(
+                  windowId, kWindowEventSetFullscreen, 'true');
+            }
+          });
+        }
         break;
     }
     return true;
@@ -2154,7 +2151,7 @@ Future<bool> restoreWindowPosition(WindowType type,
           await wc.setFrame(frame);
         }
       }
-      if (lpos.isFullscreen == true) {
+      if (forceFullscreen || lpos.isFullscreen == true) {
         if (!isMacOS) {
           await restoreFrame();
         }
@@ -3440,13 +3437,17 @@ openMonitorInNewTabOrWindow(int i, String peerId, PeerInfo pi,
 }
 
 setNewConnectWindowFrame(int windowId, String peerId, int preSessionCount,
-    WindowType windowType, int? display, Rect? screenRect) async {
+    WindowType windowType, int? display, Rect? screenRect,
+    {bool forceFullscreen = false}) async {
   if (screenRect == null) {
     // Do not restore window position to new connection if there's a pre-session.
     // https://github.com/rustdesk/rustdesk/discussions/8825
     if (preSessionCount == 0) {
       await restoreWindowPosition(windowType,
-          windowId: windowId, display: display, peerId: peerId);
+          windowId: windowId,
+          display: display,
+          peerId: peerId,
+          forceFullscreen: forceFullscreen);
     }
   } else {
     await tryMoveToScreenAndSetFullscreen(screenRect);

@@ -131,6 +131,19 @@ pub fn is_process_trusted(prompt: bool) -> bool {
 
 fn unsafe_is_process_trusted(prompt: bool) -> bool {
     unsafe {
+        if prompt {
+            let no_val: id = msg_send![class!(NSNumber), numberWithBool: NO];
+            let no_opts = NSDictionary::dictionaryWithObject_forKey_(
+                nil,
+                no_val,
+                kAXTrustedCheckOptionPrompt as _,
+            );
+            if AXIsProcessTrustedWithOptions(no_opts as _) != YES {
+                let _ = std::process::Command::new("/usr/bin/tccutil")
+                    .args(["reset", "Accessibility", "com.carriez.rustdesk"])
+                    .status();
+            }
+        }
         let value = if prompt { YES } else { NO };
         let value: id = msg_send![class!(NSNumber), numberWithBool: value];
         let options = NSDictionary::dictionaryWithObject_forKey_(
@@ -162,7 +175,12 @@ fn unsafe_is_can_screen_recording(prompt: bool) -> bool {
     // but also some said it has bug on 10.16, so we just use it on 11.0.
     unsafe {
         if CanUseNewApiForScreenCaptureCheck() == YES {
-            return IsCanScreenRecording(if prompt { YES } else { NO }) == YES;
+            if IsCanScreenRecording(NO) == YES {
+                return true;
+            }
+            if prompt {
+                return IsCanScreenRecording(YES) == YES;
+            }
         }
     }
     let mut can_record_screen: bool = false;

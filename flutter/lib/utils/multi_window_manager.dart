@@ -59,6 +59,7 @@ class RustDeskMultiWindowManager {
 
   final Set<int> _inactiveWindows = {};
   final Set<int> _activeWindows = {};
+  final Set<int> _fullscreenRemoteWindows = {};
   final List<AsyncCallback> _windowActiveCallbacks = List.empty(growable: true);
   final List<int> _remoteDesktopWindows = List.empty(growable: true);
   final List<int> _fileTransferWindows = List.empty(growable: true);
@@ -67,22 +68,28 @@ class RustDeskMultiWindowManager {
   final List<int> _terminalWindows = List.empty(growable: true);
 
   moveTabToNewWindow(int windowId, String peerId, String sessionId,
-      WindowType windowType) async {
+      WindowType windowType,
+      {bool fullscreen = false}) async {
     var params = {
       'type': windowType.index,
       'id': peerId,
       'tab_window_id': windowId,
       'session_id': sessionId,
+      if (fullscreen) 'fullscreen': true,
     };
     if (windowType == WindowType.RemoteDesktop) {
-      await _newSession(
+      final res = await _newSession(
         false,
         WindowType.RemoteDesktop,
         kWindowEventNewRemoteDesktop,
         peerId,
         _remoteDesktopWindows,
         jsonEncode(params),
+        forceFullscreen: fullscreen,
       );
+      if (fullscreen && res.windowId != kInvalidWindowId) {
+        _fullscreenRemoteWindows.add(res.windowId);
+      }
     } else if (windowType == WindowType.ViewCamera) {
       await _newSession(
         false,
@@ -187,6 +194,7 @@ class RustDeskMultiWindowManager {
     List<int> windows,
     String msg, {
     Rect? screenRect,
+    bool forceFullscreen = false,
   }) async {
     if (openInTabs) {
       if (windows.isEmpty) {
@@ -202,7 +210,9 @@ class RustDeskMultiWindowManager {
           if (_inactiveWindows.contains(windowId)) {
             if (screenRect == null) {
               await restoreWindowPosition(type,
-                  windowId: windowId, peerId: remoteId);
+                  windowId: windowId,
+                  peerId: remoteId,
+                  forceFullscreen: forceFullscreen);
             }
             await DesktopMultiWindow.invokeMethod(windowId, methodName, msg);
             if (methodName != kWindowEventNewRemoteDesktop) {
@@ -249,11 +259,18 @@ class RustDeskMultiWindowManager {
     if (connToken != null) {
       params['connToken'] = connToken;
     }
+    final bool forceSeparateFullscreen = isMacOS &&
+        type == WindowType.RemoteDesktop &&
+        _fullscreenRemoteWindows.isNotEmpty;
+    if (forceSeparateFullscreen) {
+      params['fullscreen'] = true;
+    }
     final msg = jsonEncode(params);
 
     // separate window for file transfer is not supported
-    bool openInTabs = type != WindowType.RemoteDesktop ||
-        mainGetLocalBoolOptionSync(kOptionOpenNewConnInTabs);
+    bool openInTabs = !forceSeparateFullscreen &&
+        (type != WindowType.RemoteDesktop ||
+            mainGetLocalBoolOptionSync(kOptionOpenNewConnInTabs));
 
     if (windows.length > 1 || !openInTabs) {
       for (final windowId in windows) {
@@ -264,7 +281,19 @@ class RustDeskMultiWindowManager {
       }
     }
 
-    return _newSession(openInTabs, type, methodName, remoteId, windows, msg);
+    final res = await _newSession(
+      openInTabs,
+      type,
+      methodName,
+      remoteId,
+      windows,
+      msg,
+      forceFullscreen: forceSeparateFullscreen,
+    );
+    if (forceSeparateFullscreen && res.windowId != kInvalidWindowId) {
+      _fullscreenRemoteWindows.add(res.windowId);
+    }
+    return res;
   }
 
   Future<MultiWindowCallResult> newRemoteDesktop(
@@ -427,6 +456,7 @@ class RustDeskMultiWindowManager {
         return;
       case WindowType.RemoteDesktop:
         _remoteDesktopWindows.clear();
+        _fullscreenRemoteWindows.clear();
         break;
       case WindowType.FileTransfer:
         _fileTransferWindows.clear();
@@ -530,10 +560,30 @@ class RustDeskMultiWindowManager {
   /// `rustDeskWinManager.call(WindowType.Main, kWindowEventHide, {"id": windowId!});`
   Future<void> unregisterActiveWindow(int windowId) async {
     _activeWindows.remove(windowId);
+    _fullscreenRemoteWindows.remove(windowId);
     if (windowId != kMainWindowId) {
       _inactiveWindows.add(windowId);
     }
     await _notifyActiveWindow();
+  }
+
+  Future<void> onRemoteWindowFullscreenChanged(
+      int windowId, bool fullscreen) async {
+    if (!isMacOS) return;
+    if (fullscreen) {
+      _fullscreenRemoteWindows.add(windowId);
+      for (final wId in List<int>.from(_remoteDesktopWindows)) {
+        if (wId != windowId &&
+            _activeWindows.contains(wId) &&
+            !_fullscreenRemoteWindows.contains(wId)) {
+          _fullscreenRemoteWindows.add(wId);
+          await DesktopMultiWindow.invokeMethod(
+              wId, kWindowEventSetFullscreen, 'true');
+        }
+      }
+    } else {
+      _fullscreenRemoteWindows.remove(windowId);
+    }
   }
 
   void registerActiveWindowListener(AsyncCallback callback) {

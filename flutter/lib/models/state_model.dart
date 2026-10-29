@@ -3,6 +3,7 @@ import 'package:flutter_hbb/common.dart';
 import 'package:get/get.dart';
 
 import '../consts.dart';
+import '../utils/platform_channel.dart';
 import './platform_model.dart';
 
 enum SvcStatus { notReady, connecting, ready }
@@ -106,11 +107,15 @@ class StateGlobal {
     print("fullscreen: $fullscreen, resizeEdgeSize: ${_resizeEdgeSize.value}");
     _windowBorderWidth.value = fullscreen.isTrue ? 0 : kWindowBorderWidth;
     if (procWnd) {
-      final wc = WindowController.fromWindowId(windowId);
-      wc.setFullscreen(_fullscreen.isTrue).then((_) {
-        // We remove the redraw (width + 1, height + 1), because this issue cannot be reproduced.
-        // https://github.com/rustdesk/rustdesk/issues/9675
-      });
+      if (isMacOS) {
+        RdPlatformChannel.instance.setWindowFullScreen(_fullscreen.isTrue);
+      } else {
+        final wc = WindowController.fromWindowId(windowId);
+        wc.setFullscreen(_fullscreen.isTrue).then((_) {
+          // We remove the redraw (width + 1, height + 1), because this issue cannot be reproduced.
+          // https://github.com/rustdesk/rustdesk/issues/9675
+        });
+      }
     }
   }
 

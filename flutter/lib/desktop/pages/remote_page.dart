@@ -633,7 +633,7 @@ class _RemotePageState extends State<RemotePage>
   void onWindowEnterFullScreen() {
     super.onWindowEnterFullScreen();
     if (isMacOS) {
-      stateGlobal.setFullscreen(true);
+      stateGlobal.setFullscreen(true, procWnd: false);
       _queueMacOSKeyboardAfterFullScreen();
     }
   }
@@ -642,7 +642,7 @@ class _RemotePageState extends State<RemotePage>
   void onWindowLeaveFullScreen() {
     super.onWindowLeaveFullScreen();
     if (isMacOS) {
-      stateGlobal.setFullscreen(false);
+      stateGlobal.setFullscreen(false, procWnd: false);
       _queueMacOSKeyboardAfterFullScreen();
     }
   }

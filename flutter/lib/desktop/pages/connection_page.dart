@@ -4,7 +4,9 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:math';
 
+import 'package:bot_toast/bot_toast.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/widgets/connection_page_title.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/widgets/popup_menu.dart';
@@ -314,7 +316,9 @@ class _ConnectionPageState extends State<ConnectionPage>
                 Flexible(child: _buildRemoteIDTextField(context)),
               ],
             ).marginOnly(top: 22),
-            SizedBox(height: 12),
+            const SizedBox(height: 10),
+            const _HotUpdateSyncBar().paddingOnly(right: 12),
+            const SizedBox(height: 8),
             Divider().paddingOnly(right: 12),
             Expanded(child: PeerTabPage()),
           ],
@@ -622,5 +626,232 @@ class _ConnectionPageState extends State<ConnectionPage>
     );
     return Container(
         constraints: const BoxConstraints(maxWidth: 600), child: w);
+  }
+}
+
+class _HotUpdateSyncBar extends StatefulWidget {
+  const _HotUpdateSyncBar({Key? key}) : super(key: key);
+
+  @override
+  State<_HotUpdateSyncBar> createState() => _HotUpdateSyncBarState();
+}
+
+class _HotUpdateSyncBarState extends State<_HotUpdateSyncBar> {
+  String _localVersion = '1.5.1';
+  int _localBuild = 70;
+  String _remoteVersion = '1.5.1';
+  int _remoteBuild = 70;
+  String _state = 'idle';
+  String _message = '自动热更新已就绪';
+  String _myIp = '';
+  Timer? _timer;
+
+  @override
+  void initState() {
+    super.initState();
+    _poll();
+    _timer = Timer.periodic(const Duration(milliseconds: 1500), (_) => _poll());
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+    super.dispose();
+  }
+
+  void _poll() {
+    if (!mounted) return;
+    try {
+      final raw = bind.mainGetCommonSync(key: 'lan_hot_update_status');
+      final myIp = bind.mainGetCommonSync(key: 'lan_mesh_my_ip');
+      if (raw.isNotEmpty) {
+        final m = jsonDecode(raw) as Map<String, dynamic>;
+        final lv = (m['local_version'] as String?) ?? '1.5.1';
+        final lb = (m['local_build'] as num?)?.toInt() ?? 70;
+        final rv = (m['remote_version'] as String?) ?? lv;
+        final rb = (m['remote_build'] as num?)?.toInt() ?? lb;
+        final st = (m['state'] as String?) ?? 'idle';
+        final msg = (m['message'] as String?) ?? '';
+        if (lv != _localVersion ||
+            lb != _localBuild ||
+            rv != _remoteVersion ||
+            rb != _remoteBuild ||
+            st != _state ||
+            msg != _message ||
+            myIp != _myIp) {
+          setState(() {
+            _localVersion = lv;
+            _localBuild = lb;
+            _remoteVersion = rv;
+            _remoteBuild = rb;
+            _state = st;
+            _message = msg;
+            _myIp = myIp;
+          });
+        }
+      }
+    } catch (_) {}
+  }
+
+  List<String> _collectAllPeerIds() {
+    final ids = <String>{};
+    for (final p in gFFI.recentPeersModel.peers) {
+      if (p.id.isNotEmpty) ids.add(p.id);
+    }
+    for (final p in gFFI.lanPeersModel.peers) {
+      if (p.id.isNotEmpty) ids.add(p.id);
+    }
+    for (final p in gFFI.abModel.allPeers()) {
+      if (p.id.isNotEmpty) ids.add(p.id);
+    }
+    for (final p in gFFI.groupModel.peers) {
+      if (p.id.isNotEmpty) ids.add(p.id);
+    }
+    return ids.toList();
+  }
+
+  void _triggerSync({required bool forceSelf}) {
+    final peers = _collectAllPeerIds();
+    bind.mainSetCommon(
+      key: 'lan_hot_update_sync',
+      value: jsonEncode({
+        'peers': peers,
+        'force_self': forceSelf,
+      }),
+    );
+    BotToast.showText(
+      text: forceSelf
+          ? '正在拉取最新热更新包并热替换本机客户端...'
+          : '已向全部客户端推送同步热更新指令！',
+    );
+    Future.delayed(const Duration(milliseconds: 300), _poll);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final bool isBusy = _state == 'downloading' ||
+        _state == 'applying' ||
+        _state == 'publishing' ||
+        _state == 'syncing';
+    final bool hasNewer = _remoteBuild > _localBuild;
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: isDark
+            ? Colors.white.withOpacity(0.05)
+            : Colors.black.withOpacity(0.035),
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(
+          color: hasNewer
+              ? const Color(0xFFF59E0B).withOpacity(0.6)
+              : const Color(0xFF22C55E).withOpacity(0.35),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isBusy
+                ? Icons.sync_rounded
+                : (hasNewer
+                    ? Icons.system_update_alt_rounded
+                    : Icons.verified_rounded),
+            size: 16,
+            color: hasNewer
+                ? const Color(0xFFF59E0B)
+                : const Color(0xFF22C55E),
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Row(
+                  children: [
+                    Text(
+                      '热更新 v$_localVersion (#$_localBuild)',
+                      style: const TextStyle(
+                        fontSize: 12,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                    if (_myIp.isNotEmpty) ...[
+                      const SizedBox(width: 8),
+                      InkWell(
+                        onTap: () {
+                          Clipboard.setData(ClipboardData(text: _myIp));
+                          BotToast.showText(text: '已复制本机局域网 IP: $_myIp');
+                        },
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 6, vertical: 1),
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF22C55E).withOpacity(0.15),
+                            borderRadius: BorderRadius.circular(4),
+                          ),
+                          child: Text(
+                            '本机 LAN: $_myIp',
+                            style: const TextStyle(
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF22C55E),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  _message,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.color
+                        ?.withOpacity(0.75),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const SizedBox(width: 8),
+          SizedBox(
+            height: 28,
+            child: OutlinedButton.icon(
+              style: OutlinedButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                textStyle: const TextStyle(fontSize: 11.5),
+              ),
+              onPressed: isBusy ? null : () => _triggerSync(forceSelf: true),
+              icon: const Icon(Icons.download_rounded, size: 13),
+              label: const Text('热更新本机'),
+            ),
+          ),
+          const SizedBox(width: 6),
+          SizedBox(
+            height: 28,
+            child: ElevatedButton.icon(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF22C55E),
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(horizontal: 10),
+                textStyle: const TextStyle(
+                    fontSize: 11.5, fontWeight: FontWeight.w600),
+              ),
+              onPressed: isBusy ? null : () => _triggerSync(forceSelf: false),
+              icon: const Icon(Icons.sync_rounded, size: 13),
+              label: const Text('同步更新全部客户端'),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 }

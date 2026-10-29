@@ -49,6 +49,8 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   String? peerId;
   bool _isScreenRectSet = false;
   int? _display;
+  Worker? _fullscreenWorker;
+  final Set<String> _movingToFullscreenTabKeys = {};
 
   var connectionMap = RxList<Widget>.empty(growable: true);
 
@@ -114,6 +116,10 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
   void initState() {
     super.initState();
 
+    if (isMacOS) {
+      _fullscreenWorker = ever(stateGlobal.fullscreen, _onMacOSFullscreenChanged);
+    }
+
     if (!_isScreenRectSet) {
       Future.delayed(Duration.zero, () {
         restoreWindowPosition(
@@ -123,7 +129,66 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
               ? null
               : tabController.state.value.tabs[0].key,
           display: _display,
+          forceFullscreen: widget.params['fullscreen'] == true,
         );
+      });
+    }
+  }
+
+  @override
+  void dispose() {
+    _fullscreenWorker?.dispose();
+    super.dispose();
+  }
+
+  void _onMacOSFullscreenChanged(bool isFullscreen) {
+    if (!isMacOS) return;
+    DesktopMultiWindow.invokeMethod(
+      kMainWindowId,
+      kWindowEventRemoteFullscreenChanged,
+      jsonEncode({
+        'window_id': windowId(),
+        'fullscreen': isFullscreen,
+      }),
+    );
+    if (isFullscreen) {
+      _splitOtherTabsToFullscreenWindows();
+    }
+  }
+
+  void _splitOtherTabsToFullscreenWindows() {
+    if (!isMacOS || stateGlobal.fullscreen.isFalse) return;
+    final tabs = List<TabInfo>.from(tabController.state.value.tabs);
+    if (tabs.length <= 1) return;
+    final selectedIdx =
+        tabController.state.value.selected.clamp(0, tabs.length - 1);
+    final selectedKey = tabs[selectedIdx].key;
+    for (final tab in tabs) {
+      if (tab.key == selectedKey) continue;
+      _moveTabToNewFullscreenWindow(tab);
+    }
+  }
+
+  void _moveTabToNewFullscreenWindow(TabInfo tab) {
+    if (_movingToFullscreenTabKeys.contains(tab.key)) return;
+    final page = tab.page;
+    if (page is! RemotePage) return;
+    if (page.ffi.ffiModel.pi.isSet.isTrue) {
+      _movingToFullscreenTabKeys.add(tab.key);
+      DesktopMultiWindow.invokeMethod(
+        kMainWindowId,
+        kWindowEventMoveTabToNewWindow,
+        '${windowId()},${tab.key},${page.ffi.sessionId},RemoteDesktop,1',
+      );
+    } else {
+      once(page.ffi.ffiModel.pi.isSet, (bool isSet) {
+        if (isSet &&
+            mounted &&
+            stateGlobal.fullscreen.isTrue &&
+            tabController.state.value.tabs.length > 1 &&
+            tabController.state.value.tabs.any((t) => t.key == tab.key)) {
+          _moveTabToNewFullscreenWindow(tab);
+        }
       });
     }
   }
@@ -380,6 +445,7 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
       loopCloseWindow();
     }
     ConnectionTypeState.delete(id);
+    _movingToFullscreenTabKeys.remove(id);
     // Clean up relative mouse mode state for this peer.
     stateGlobal.relativeMouseModeState.remove(id);
     _update_remote_count();
@@ -435,14 +501,16 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
       final display = args['display'];
       final displays = args['displays'];
       final screenRect = parseParamScreenRect(args);
+      final forceFullscreen = args['fullscreen'] == true;
       final prePeerCount = tabController.length;
       Future.delayed(Duration.zero, () async {
-        if (stateGlobal.fullscreen.isTrue) {
+        if (stateGlobal.fullscreen.isTrue && !forceFullscreen && !isMacOS) {
           await WindowController.fromWindowId(windowId()).setFullscreen(false);
           stateGlobal.setFullscreen(false, procWnd: false);
         }
         await setNewConnectWindowFrame(windowId(), id!, prePeerCount,
-            WindowType.RemoteDesktop, display, screenRect);
+            WindowType.RemoteDesktop, display, screenRect,
+            forceFullscreen: forceFullscreen);
         Future.delayed(Duration(milliseconds: isWindows ? 100 : 0), () async {
           await windowOnTop(windowId());
         });
@@ -477,6 +545,9 @@ class _ConnectionTabPageState extends State<ConnectionTabPage> {
           isSharedPassword: args['isSharedPassword'],
         ),
       ));
+      if (isMacOS && stateGlobal.fullscreen.isTrue) {
+        _splitOtherTabsToFullscreenWindows();
+      }
     } else if (call.method == kWindowDisableGrabKeyboard) {
       // ???
     } else if (call.method == "onDestroy") {

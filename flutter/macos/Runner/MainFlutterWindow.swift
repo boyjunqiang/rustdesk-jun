@@ -35,6 +35,113 @@ class RelativeMouseState {
     private init() {}
 }
 
+final class FullScreenTransitionCoordinator {
+    static let shared = FullScreenTransitionCoordinator()
+
+    private struct PendingRequest {
+        weak var window: NSWindow?
+        var fullScreen: Bool
+    }
+
+    private let transitionTargets = NSMapTable<NSWindow, NSNumber>(
+        keyOptions: [.weakMemory, .objectPointerPersonality],
+        valueOptions: .strongMemory
+    )
+    private var queue: [PendingRequest] = []
+    private var isTransitioning = false
+    private var watchdogWorkItem: DispatchWorkItem?
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        let nc = NotificationCenter.default
+        observers.append(nc.addObserver(forName: NSWindow.willEnterFullScreenNotification, object: nil, queue: .main) { [weak self] n in
+            guard let window = n.object as? NSWindow else { return }
+            self?.beginTransition(for: window, targetFullScreen: true)
+        })
+        observers.append(nc.addObserver(forName: NSWindow.willExitFullScreenNotification, object: nil, queue: .main) { [weak self] n in
+            guard let window = n.object as? NSWindow else { return }
+            self?.beginTransition(for: window, targetFullScreen: false)
+        })
+        let endNames: [NSNotification.Name] = [
+            NSWindow.didEnterFullScreenNotification,
+            NSWindow.didExitFullScreenNotification,
+            NSNotification.Name("NSWindowDidFailToEnterFullScreenNotification"),
+            NSNotification.Name("NSWindowDidFailToExitFullScreenNotification")
+        ]
+        for name in endNames {
+            observers.append(nc.addObserver(forName: name, object: nil, queue: .main) { [weak self] n in
+                guard let window = n.object as? NSWindow else { return }
+                self?.endTransition(for: window)
+            })
+        }
+    }
+
+    private func effectiveFullScreen(for window: NSWindow) -> Bool {
+        if let target = transitionTargets.object(forKey: window) {
+            return target.boolValue
+        }
+        return window.styleMask.contains(.fullScreen)
+    }
+
+    private func beginTransition(for window: NSWindow, targetFullScreen: Bool) {
+        transitionTargets.setObject(NSNumber(value: targetFullScreen), forKey: window)
+        isTransitioning = true
+        scheduleWatchdog()
+    }
+
+    private func endTransition(for window: NSWindow) {
+        transitionTargets.removeObject(forKey: window)
+        watchdogWorkItem?.cancel()
+        watchdogWorkItem = nil
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            guard let self = self else { return }
+            self.isTransitioning = false
+            self.processQueue()
+        }
+    }
+
+    private func scheduleWatchdog() {
+        watchdogWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.isTransitioning = false
+            self.processQueue()
+        }
+        watchdogWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2, execute: item)
+    }
+
+    func requestFullScreen(for window: NSWindow, fullScreen: Bool) {
+        assert(Thread.isMainThread)
+        if let idx = queue.firstIndex(where: { $0.window === window }) {
+            queue[idx].fullScreen = fullScreen
+        } else {
+            if effectiveFullScreen(for: window) == fullScreen {
+                return
+            }
+            queue.append(PendingRequest(window: window, fullScreen: fullScreen))
+        }
+        processQueue()
+    }
+
+    private func processQueue() {
+        while !isTransitioning && !queue.isEmpty {
+            let req = queue.removeFirst()
+            guard let window = req.window else { continue }
+            if effectiveFullScreen(for: window) == req.fullScreen {
+                continue
+            }
+            window.collectionBehavior.insert(.fullScreenPrimary)
+            if req.fullScreen && !window.isVisible {
+                window.makeKeyAndOrderFront(nil)
+            }
+            beginTransition(for: window, targetFullScreen: req.fullScreen)
+            window.toggleFullScreen(nil)
+            break
+        }
+    }
+}
+
 class MainFlutterWindow: NSWindow {
     private static let fullscreenWorkAreaSizes = NSMapTable<NSWindow, NSValue>(
         keyOptions: [.weakMemory, .objectPointerPersonality],
@@ -58,6 +165,7 @@ class MainFlutterWindow: NSWindow {
     override func awakeFromNib() {
         rustdesk_core_main();
         _ = MainFlutterWindow.fullscreenObserver
+        _ = FullScreenTransitionCoordinator.shared
         let flutterViewController = FlutterViewController.init()
         let windowFrame = self.frame
         self.contentViewController = flutterViewController
@@ -307,6 +415,21 @@ class MainFlutterWindow: NSWindow {
                         break
                     }
                     result([Double(size.width), Double(size.height)])
+
+                case "setWindowFullScreen":
+                    guard Thread.isMainThread,
+                          let window = registrar.view?.window else {
+                        result(false)
+                        break
+                    }
+                    let fullScreen = (call.arguments as? [String: Any])?["fullScreen"] as? Bool
+                        ?? (call.arguments as? Bool)
+                        ?? false
+                    FullScreenTransitionCoordinator.shared.requestFullScreen(
+                        for: window,
+                        fullScreen: fullScreen
+                    )
+                    result(true)
 
                 default:
                     result(FlutterMethodNotImplemented)

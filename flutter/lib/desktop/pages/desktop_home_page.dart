@@ -476,7 +476,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
     } else if (isMacOS) {
       final isOutgoingOnly = bind.isOutgoingOnly();
-      if (!(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {
+      const keyHideMacPermCard = 'hide-macos-perm-card';
+      final hidePermCard =
+          bind.mainGetLocalOption(key: keyHideMacPermCard) == 'N';
+      if (!hidePermCard &&
+          !(isOutgoingOnly || bind.mainIsCanScreenRecording(prompt: false))) {
         return buildInstallCard("Permissions", "config_screen", "Configure",
             () async {
           bind.mainIsCanScreenRecording(prompt: true);
@@ -485,19 +489,33 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           launchUrl(Uri.parse(
               'x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture'));
           watchIsCanScreenRecording = true;
-        }, help: 'Help', link: translate("doc_mac_permission"));
-      } else if (!isOutgoingOnly && !bind.mainIsProcessTrusted(prompt: false)) {
+        },
+            help: 'Help',
+            link: translate("doc_mac_permission"),
+            closeButton: true,
+            closeOption: keyHideMacPermCard);
+      } else if (!hidePermCard &&
+          !isOutgoingOnly &&
+          !bind.mainIsProcessTrusted(prompt: false)) {
         return buildInstallCard("Permissions", "config_acc", "Configure",
             () async {
           bind.mainIsProcessTrusted(prompt: true);
           watchIsProcessTrust = true;
-        }, help: 'Help', link: translate("doc_mac_permission"));
-      } else if (!bind.mainIsCanInputMonitoring(prompt: false)) {
+        },
+            help: 'Help',
+            link: translate("doc_mac_permission"),
+            closeButton: true,
+            closeOption: keyHideMacPermCard);
+      } else if (!hidePermCard && !bind.mainIsCanInputMonitoring(prompt: false)) {
         return buildInstallCard("Permissions", "config_input", "Configure",
             () async {
           bind.mainIsCanInputMonitoring(prompt: true);
           watchIsInputMonitoring = true;
-        }, help: 'Help', link: translate("doc_mac_permission"));
+        },
+            help: 'Help',
+            link: translate("doc_mac_permission"),
+            closeButton: true,
+            closeOption: keyHideMacPermCard);
       } else if (!isOutgoingOnly &&
           !svcStopped.value &&
           bind.mainIsInstalled() &&
@@ -824,8 +842,18 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           debugPrint("Failed to parse window type '${call.arguments}': $e");
         }
         if (windowId != null && windowType != null) {
+          final fullscreen = args.length > 4 && args[4] == '1';
           await rustDeskWinManager.moveTabToNewWindow(
-              windowId, args[1], args[2], windowType);
+              windowId, args[1], args[2], windowType,
+              fullscreen: fullscreen);
+        }
+      } else if (call.method == kWindowEventRemoteFullscreenChanged) {
+        final args = jsonDecode(call.arguments);
+        final windowId = args['window_id'] as int?;
+        final fullscreen = args['fullscreen'] == true;
+        if (windowId != null) {
+          await rustDeskWinManager.onRemoteWindowFullscreenChanged(
+              windowId, fullscreen);
         }
       } else if (call.method == kWindowEventOpenMonitorSession) {
         final args = jsonDecode(call.arguments);

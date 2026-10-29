@@ -38,21 +38,32 @@ pub struct PortForwardMux {
     /// Raised once, by `close_all`, for the channels its `clear` cannot reach:
     /// one parked on its target socket is not on the inbound queue.
     teardown: watch::Sender<bool>,
+    reverse: Arc<crate::lan_mesh::ReverseLanPeer>,
 }
 
 impl PortForwardMux {
     pub fn new(tx: Sender, login_target: String) -> Self {
+        let teardown = watch::channel(false).0;
+        let reverse = crate::lan_mesh::ReverseLanPeer::new(
+            FrameSink::Direct(tx.clone()),
+            teardown.subscribe(),
+        );
         Self {
             channels: HashMap::new(),
             tx,
             login_target,
-            teardown: watch::channel(false).0,
+            teardown,
+            reverse,
         }
     }
 
     /// `tunnel_permitted` is consulted for `open` alone, so the lookup is not
     /// made per 64 KiB of data.
     pub fn handle(&mut self, frame: PortForwardChannel, tunnel_permitted: impl FnOnce() -> bool) {
+        if crate::lan_mesh::is_reverse_channel_frame(&frame) {
+            self.reverse.on_frame(frame);
+            return;
+        }
         match frame.union {
             Some(port_forward_channel::Union::Open(open)) => {
                 let permitted = tunnel_permitted();
@@ -117,15 +128,25 @@ impl PortForwardMux {
             log::debug!("ignoring open for live channel {}", id);
             return;
         }
+        if open.host.starts_with("__lan_ports__") || open.host.starts_with("__lan_update__") {
+            let ports_msg = self.reverse.handle_probe(&open.host);
+            self.reply(opened_msg(id, false, &ports_msg, 0));
+            return;
+        }
+        let is_lan_tunnel = self.login_target == "LAN:0" || self.login_target == "localhost:0";
         let mut pf = PortForward {
-            host: open.host,
+            host: if is_lan_tunnel && (open.host.is_empty() || open.host == "LAN") {
+                "127.0.0.1".to_owned()
+            } else {
+                open.host
+            },
             port: open.port,
             ..Default::default()
         };
         let (addr, is_rdp) = Connection::normalize_port_forward_target(&mut pf);
         // Approval and permission checks saw the login's target; a tunnel
         // serves that one target and nothing else.
-        if addr != self.login_target {
+        if !is_lan_tunnel && addr != self.login_target {
             log::warn!(
                 "port forward channel {} asked for {} on a tunnel logged in for {}",
                 id,
@@ -182,7 +203,7 @@ impl PortForwardMux {
 /// Owns the whole channel lifecycle: connect under a `select!` in which a
 /// queued command always wins over the connect, buffer what arrives
 /// meanwhile, then relay.
-async fn run_controlled_channel(
+pub(crate) async fn run_controlled_channel(
     id: i32,
     addr: String,
     is_rdp: bool,

@@ -42,4 +42,10 @@ class RdPlatformChannel {
     assert(isMacOS);
     return _hostMethodChannel.invokeMethod("terminate");
   }
+
+  Future<void> setWindowFullScreen(bool fullScreen) {
+    assert(isMacOS);
+    return _hostMethodChannel
+        .invokeMethod("setWindowFullScreen", {"fullScreen": fullScreen});
+  }
 }

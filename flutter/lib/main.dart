@@ -248,6 +248,7 @@ void runMultiWindow(
           windowId: kWindowId!,
           peerId: argument['id'] as String?,
           display: argument['display'] as int?,
+          forceFullscreen: argument['fullscreen'] == true,
         );
       }
       break;

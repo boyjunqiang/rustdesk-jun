@@ -135,10 +135,10 @@ class DesktopTabController {
     if (index < 0 || index > len - 1) return;
     final key = state.value.tabs[index].key;
     final currentSelected = state.value.selected;
-    int toIndex = 0;
-    if (index == len - 1) {
+    int toIndex = currentSelected;
+    if (index < currentSelected) {
       toIndex = max(0, currentSelected - 1);
-    } else if (index < len - 1 && index < currentSelected) {
+    } else if (index == currentSelected && index == len - 1) {
       toIndex = max(0, currentSelected - 1);
     }
     state.value.tabs.removeAt(index);
@@ -157,14 +157,15 @@ class DesktopTabController {
       if (val != null) {
         val.selected = index;
         Future.delayed(Duration(milliseconds: 100), (() {
-          if (val.pageController.hasClients) {
-            val.pageController.jumpToPage(index);
+          final target = val.selected;
+          if (val.pageController.hasClients && target < val.tabs.length) {
+            val.pageController.jumpToPage(target);
           }
           val.scrollController.itemCount = val.tabs.length;
           if (val.scrollController.hasClients &&
-              val.scrollController.itemCount > index) {
+              val.scrollController.itemCount > target) {
             val.scrollController
-                .scrollToItem(index, center: false, animate: true);
+                .scrollToItem(target, center: false, animate: true);
           }
         }));
       }
@@ -435,6 +436,18 @@ class _DesktopTabState extends State<DesktopTab>
   void onWindowResized() {
     _saveFrame();
     super.onWindowResized();
+  }
+
+  @override
+  void onWindowEnterFullScreen() {
+    _saveFrame();
+    super.onWindowEnterFullScreen();
+  }
+
+  @override
+  void onWindowLeaveFullScreen() {
+    _saveFrame();
+    super.onWindowLeaveFullScreen();
   }
 
   @override

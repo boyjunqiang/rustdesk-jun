@@ -2830,6 +2830,22 @@ pub fn main_get_common(key: String) -> String {
 }
 
 pub fn main_get_common_sync(key: String) -> SyncReturn<String> {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if key == "lan_mesh_all" {
+            return SyncReturn(crate::lan_mesh::get_all_lan_states_json());
+        }
+        if let Some(peer_id) = key.strip_prefix("lan_mesh_peer:") {
+            let st = crate::lan_mesh::get_peer_lan_state(peer_id);
+            return SyncReturn(serde_json::to_string(&st).unwrap_or_default());
+        }
+        if key == "lan_mesh_my_ip" {
+            return SyncReturn(crate::lan_mesh::get_my_lan_ip());
+        }
+        if key == "lan_hot_update_status" {
+            return SyncReturn(crate::lan_mesh::get_hot_update_status_json());
+        }
+    }
     if let Some(args) = key.strip_prefix("resolve-api-server:") {
         let response = match serde_json::from_str::<(String, String)>(args) {
             Ok((api, custom)) => serde_json::json!({"url": crate::get_api_server(api, custom)}),
@@ -2870,6 +2886,17 @@ fn verified_update_artifact_for_release_page_url(
 }
 
 pub fn main_set_common(_key: String, _value: String) {
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    {
+        if _key == "lan_mesh_toggle" {
+            crate::lan_mesh::handle_toggle_json(&_value);
+            return;
+        }
+        if _key == "lan_hot_update_sync" {
+            crate::lan_mesh::handle_hot_update_sync(&_value);
+            return;
+        }
+    }
     #[cfg(target_os = "windows")]
     if _key == "install-printer" && crate::platform::is_win_10_or_greater() {
         std::thread::spawn(move || {
