@@ -146,6 +146,13 @@ def make_parser():
              'dlopen-ed in-process by the root service). Off by default.'
     )
     parser.add_argument(
+        '--linux-pkg-config',
+        action='store_true',
+        help='Linux only: link libvpx/libyuv/libaom/opus through pkg-config (system -dev '
+             'packages) instead of vcpkg static builds. The matching shared libraries are '
+             'bundled into the app and need no extra runtime packages.'
+    )
+    parser.add_argument(
         '--print-features',
         action='store_true',
         help='Print the cargo feature list these flags select, and exit without building. For a '
@@ -322,6 +329,8 @@ def get_features(args):
         features.append('flutter')
     if args.unix_file_copy_paste:
         features.append('unix-file-copy-paste')
+    if args.linux_pkg_config:
+        features.append('linux-pkg-config')
     if args.drm:
         # Say so rather than quietly handing back a stock build: the backend is Linux-only, so on
         # any other host the flag cannot be honoured and the resulting binary would look like a
@@ -734,12 +743,56 @@ def retarget_control_to_drm_variant():
         f.write(body)
 
 
+LINUX_CODEC_LIB_PREFIXES = ('libvpx.so', 'libaom.so', 'libyuv.so', 'libopus.so')
+
+
+def bundle_linked_codec_libs():
+    # A --linux-pkg-config build links the codec libraries dynamically instead of
+    # vcpkg's static archives, so the bundle must carry the exact SONAMEs it was
+    # linked against. They go into lib/, which the runner resolves via its
+    # $ORIGIN/lib rpath; the deb copies the whole bundle and inherits the layout.
+    lib_dir = os.path.join(flutter_build_dir, 'lib')
+    rustdesk_lib = os.path.join(lib_dir, 'librustdesk.so')
+    out = subprocess.check_output(['ldd', rustdesk_lib], text=True)
+    found = {}
+    for line in out.splitlines():
+        need, sep, rest = line.strip().partition(' => ')
+        if not sep or not any(need.startswith(p) for p in LINUX_CODEC_LIB_PREFIXES):
+            continue
+        path = rest.split(' (')[0].strip()
+        if not path or path == 'not found':
+            raise Exception(f'{need} is linked by librustdesk.so but is not installed')
+        found[need] = os.path.realpath(path)
+    missing = [
+        p for p in LINUX_CODEC_LIB_PREFIXES
+        if not any(name.startswith(p) for name in found)
+    ]
+    if missing:
+        raise Exception(f'--linux-pkg-config build did not link {missing}')
+    for name, path in found.items():
+        dest = os.path.join(lib_dir, name)
+        if not os.path.exists(dest):
+            shutil.copy2(path, dest)
+        print(f'[codecs] bundled {name} from {path}')
+    # glibc resolves a dlopen-ed object's NEEDED entries with that object's own
+    # RUNPATH, not the runner's $ORIGIN/lib, so librustdesk.so has to point at
+    # the directory it and the codec libraries live in.
+    try:
+        subprocess.check_call(['patchelf', '--set-rpath', '$ORIGIN', rustdesk_lib])
+    except FileNotFoundError:
+        raise Exception(
+            'patchelf is required to point librustdesk.so at its bundled codec '
+            'libraries (apt install patchelf)')
+
+
 def build_flutter_deb(version, features):
     if not skip_cargo:
         system2(f'cargo build --locked --features {features} --lib --release')
         ffi_bindgen_function_refactor()
     os.chdir('flutter')
     system2('flutter build linux --release')
+    if 'linux-pkg-config' in features.split(','):
+        bundle_linked_codec_libs()
     system2('mkdir -p tmpdeb/usr/bin/')
     system2('mkdir -p tmpdeb/usr/share/rustdesk')
     system2('mkdir -p tmpdeb/usr/share/rustdesk/files/systemd/')

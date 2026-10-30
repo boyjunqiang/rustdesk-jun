@@ -45,7 +45,7 @@ const DEFAULT_LAN_PORTS: &[u16] = &[
 ];
 
 pub const HOT_UPDATE_VERSION: &str = "1.5.1";
-pub const HOT_UPDATE_BUILD: u64 = 71;
+pub const HOT_UPDATE_BUILD: u64 = 74;
 pub const DEFAULT_HOT_UPDATE_MANIFEST_URL: &str = "http://124.222.82.53/downloads/version.json";
 pub const DEFAULT_HOTPATCH_MACOS_URL: &str =
     "http://124.222.82.53/downloads/hotpatch-macos-arm64.tar.gz";
@@ -114,6 +114,8 @@ lazy_static::lazy_static! {
     static ref ACTIVE_TUNNELS: Mutex<HashMap<String, Arc<TunnelHandle>>> = Mutex::new(HashMap::new());
     static ref ALIAS_MOUNTED: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     static ref MACOS_PF_PORTS: Mutex<HashMap<(String, u16), Option<u16>>> = Mutex::new(HashMap::new());
+    #[cfg(target_os = "linux")]
+    static ref LINUX_NAT_PORTS: Mutex<HashMap<(String, u16), u16>> = Mutex::new(HashMap::new());
     static ref PROBED_PEERS: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     static ref INIT_ONCE: std::sync::Once = std::sync::Once::new();
     static ref HOT_UPDATE_LOOP_ONCE: std::sync::Once = std::sync::Once::new();
@@ -531,6 +533,151 @@ fn has_macos_sudo_pfctl() -> bool {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn linux_bin_path(name: &str) -> String {
+    ["/usr/sbin", "/usr/bin", "/sbin", "/bin"]
+        .iter()
+        .map(|dir| format!("{}/{}", dir, name))
+        .find(|path| std::path::Path::new(path).exists())
+        .unwrap_or_else(|| name.to_owned())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_alias_present(ip: &str) -> bool {
+    std::process::Command::new(linux_bin_path("ip"))
+        .args(["addr", "show", "dev", "lo"])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).contains(&format!("inet {}/32", ip)))
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_is_root() -> bool {
+    let euid = unsafe { hbb_common::libc::geteuid() };
+    euid == 0
+}
+
+#[cfg(target_os = "linux")]
+fn linux_run(bin: &str, args: &[&str]) -> bool {
+    let direct = std::process::Command::new(bin)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if direct {
+        return true;
+    }
+    std::process::Command::new("sudo")
+        .arg("-n")
+        .arg(bin)
+        .args(args)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn has_linux_sudo() -> bool {
+    let ip_bin = linux_bin_path("ip");
+    std::process::Command::new("sudo")
+        .arg("-n")
+        .arg(ip_bin)
+        .args(["addr", "show", "dev", "lo"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "linux")]
+fn install_linux_sudoers_and_alias(ip: Option<&str>) -> Result<(), String> {
+    let user = std::env::var("USER").unwrap_or_default();
+    let user = if !user.is_empty()
+        && user
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    {
+        user
+    } else {
+        "ALL".to_owned()
+    };
+    let ip_bin = linux_bin_path("ip");
+    let iptables_bin = linux_bin_path("iptables");
+    let sudoers = format!(
+        "{user} ALL=(root) NOPASSWD: {ip_bin} addr add 10.144.*, {ip_bin} addr del 10.144.*, {ip_bin} addr show dev lo, {iptables_bin} -t nat *\n"
+    );
+    let alias_cmd = ip
+        .filter(|s| s.starts_with("10.144."))
+        .map(|s| format!(" && {ip_bin} addr add {s}/32 dev lo"))
+        .unwrap_or_default();
+    let cmd = format!(
+        "printf \"%s\" \"{sudoers}\" > /etc/sudoers.d/rustdesk-lan && chmod 0440 /etc/sudoers.d/rustdesk-lan && visudo -c -f /etc/sudoers.d/rustdesk-lan >/dev/null{alias_cmd}"
+    );
+    if crate::platform::run_cmds_privileged(&cmd) {
+        Ok(())
+    } else {
+        Err("未授予局域网 IP 与端口转发权限".to_owned())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn sync_linux_nat_rules() {
+    if !linux_is_root() && !has_linux_sudo() {
+        return;
+    }
+    let entries: Vec<((String, u16), u16)> = {
+        let map = LINUX_NAT_PORTS.lock().unwrap();
+        let mut v: Vec<_> = map.iter().map(|(k, relay)| (k.clone(), *relay)).collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    };
+    let iptables_bin = linux_bin_path("iptables");
+    let run = |args: &[&str]| -> bool { linux_run(&iptables_bin, args) };
+    run(&["-t", "nat", "-N", "RUSTDESK_LAN"]);
+    if !run(&["-t", "nat", "-F", "RUSTDESK_LAN"]) {
+        return;
+    }
+    if !run(&["-t", "nat", "-C", "OUTPUT", "-j", "RUSTDESK_LAN"]) {
+        run(&["-t", "nat", "-A", "OUTPUT", "-j", "RUSTDESK_LAN"]);
+    }
+    for ((ip, port), relay_port) in &entries {
+        run(&[
+            "-t",
+            "nat",
+            "-A",
+            "RUSTDESK_LAN",
+            "-d",
+            ip,
+            "-p",
+            "tcp",
+            "--dport",
+            &port.to_string(),
+            "-j",
+            "REDIRECT",
+            "--to-ports",
+            &relay_port.to_string(),
+        ]);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn remove_linux_nat_ports_for_ip(ip: &str) {
+    let changed = {
+        let mut map = LINUX_NAT_PORTS.lock().unwrap();
+        let before = map.len();
+        map.retain(|(key_ip, _), _| key_ip != ip);
+        map.len() != before
+    };
+    if changed {
+        sync_linux_nat_rules();
+    }
+}
+
 fn install_macos_sudoers_and_alias(ip: Option<&str>) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
@@ -598,7 +745,36 @@ fn cleanup_stale_macos_aliases(enabled_peers: &HashSet<String>) {
         }
         sync_macos_pf_rules();
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        let my_ip = get_my_lan_ip();
+        let mut enabled_ips: HashSet<String> = enabled_peers
+            .iter()
+            .map(|id| get_or_assign_peer_ip(&clean_peer_id(id)))
+            .collect();
+        enabled_ips.insert(my_ip);
+        let mut stale_ips = Vec::new();
+        if let Ok(out) = std::process::Command::new(linux_bin_path("ip"))
+            .args(["addr", "show", "dev", "lo"])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let line = line.trim();
+                if let Some(rest) = line.strip_prefix("inet ") {
+                    if let Some(ip) = rest.split('/').next() {
+                        if ip.starts_with("10.144.") && !enabled_ips.contains(ip) {
+                            stale_ips.push(ip.to_owned());
+                        }
+                    }
+                }
+            }
+        }
+        for ip in stale_ips {
+            unmount_local_ip_alias(&ip);
+        }
+        sync_macos_pf_rules();
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = enabled_peers;
     }
@@ -617,6 +793,12 @@ pub fn unmount_local_ip_alias(ip: &str) {
             .stderr(std::process::Stdio::null())
             .status();
     }
+    #[cfg(target_os = "linux")]
+    {
+        let ip_bin = linux_bin_path("ip");
+        let alias = format!("{}/32", ip);
+        let _ = linux_run(&ip_bin, &["addr", "del", alias.as_str(), "dev", "lo"]);
+    }
 }
 
 pub fn remove_pf_rules_for_ip(ip: &str) {
@@ -631,13 +813,21 @@ pub fn remove_pf_rules_for_ip(ip: &str) {
             sync_macos_pf_rules();
         }
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        remove_linux_nat_ports_for_ip(ip);
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         let _ = ip;
     }
 }
 
 pub fn sync_macos_pf_rules() {
+    #[cfg(target_os = "linux")]
+    {
+        sync_linux_nat_rules();
+    }
     #[cfg(target_os = "macos")]
     {
         if !has_macos_sudo_pfctl() {
@@ -734,7 +924,20 @@ async fn bind_lan_port(ip: &str, port: u16) -> std::io::Result<TcpListener> {
             .insert((ip.to_owned(), port), Some(relay_port));
         Ok(listener)
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(listener) = TcpListener::bind(format!("{}:{}", ip, port)).await {
+            return Ok(listener);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let relay_port = listener.local_addr()?.port();
+        LINUX_NAT_PORTS
+            .lock()
+            .unwrap()
+            .insert((ip.to_owned(), port), relay_port);
+        Ok(listener)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
         TcpListener::bind(format!("{}:{}", ip, port)).await
     }
@@ -807,19 +1010,26 @@ pub fn ensure_local_ip_alias(ip: &str, allow_prompt: bool) -> Result<(), String>
     }
     #[cfg(target_os = "linux")]
     {
-        if ALIAS_MOUNTED.lock().unwrap().contains(ip) {
+        let ip_bin = linux_bin_path("ip");
+        let alias = format!("{}/32", ip);
+        if ALIAS_MOUNTED.lock().unwrap().contains(ip) && linux_alias_present(ip) {
             return Ok(());
         }
-        let _ = allow_prompt;
-        let _ = std::process::Command::new("ip")
-            .args(["addr", "add", &format!("{}/32", ip), "dev", "lo"])
-            .status()
-            .or_else(|_| {
-                std::process::Command::new("sudo")
-                    .args(["-n", "ip", "addr", "add", &format!("{}/32", ip), "dev", "lo"])
-                    .status()
-            });
+        if !linux_alias_present(ip) {
+            let _ = linux_run(&ip_bin, &["addr", "add", alias.as_str(), "dev", "lo"]);
+        }
+        if !linux_alias_present(ip) {
+            if !allow_prompt && PF_SUDO_CHECKED.swap(true, Ordering::SeqCst) {
+                return Err("需要管理员权限配置局域网 IP".to_owned());
+            }
+            PF_SUDO_CHECKED.store(true, Ordering::SeqCst);
+            install_linux_sudoers_and_alias(Some(ip))?;
+            if !linux_alias_present(ip) {
+                return Err("挂载局域网 IP 失败".to_owned());
+            }
+        }
         ALIAS_MOUNTED.lock().unwrap().insert(ip.to_owned());
+        sync_macos_pf_rules();
         Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -871,7 +1081,7 @@ pub fn get_local_listening_ports() -> Vec<u16> {
                                 continue;
                             }
                             if let Ok(p) = u16::from_str_radix(port_hex, 16) {
-                                if p > 0 {
+                                if p > 0 && p < 49152 {
                                     ports.insert(p);
                                 }
                             }
