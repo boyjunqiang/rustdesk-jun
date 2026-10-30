@@ -727,6 +727,49 @@ class _HotUpdateSyncBarState extends State<_HotUpdateSyncBar> {
     Future.delayed(const Duration(milliseconds: 300), _poll);
   }
 
+  Widget _buildLanChip() {
+    return InkWell(
+      onTap: () {
+        Clipboard.setData(ClipboardData(text: _myIp));
+        BotToast.showText(text: '已复制本机局域网 IP: $_myIp');
+      },
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+        decoration: BoxDecoration(
+          color: const Color(0xFF22C55E).withOpacity(0.15),
+          borderRadius: BorderRadius.circular(4),
+        ),
+        child: Text(
+          '本机 LAN: $_myIp',
+          style: const TextStyle(
+            fontSize: 10.5,
+            fontWeight: FontWeight.w600,
+            color: Color(0xFF22C55E),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildUpToDateRow(BuildContext context) {
+    final color = Theme.of(context).textTheme.bodySmall?.color?.withOpacity(0.6);
+    return Row(
+      children: [
+        const Icon(Icons.verified_rounded, size: 13, color: Color(0xFF22C55E)),
+        const SizedBox(width: 6),
+        Text(
+          '热更新 v$_localVersion (#$_localBuild) 已是最新',
+          style: TextStyle(fontSize: 11, color: color),
+        ),
+        if (_myIp.isNotEmpty) ...[
+          const SizedBox(width: 8),
+          _buildLanChip(),
+        ],
+        const Spacer(),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final isDark = Theme.of(context).brightness == Brightness.dark;
@@ -735,6 +778,9 @@ class _HotUpdateSyncBarState extends State<_HotUpdateSyncBar> {
         _state == 'publishing' ||
         _state == 'syncing';
     final bool hasNewer = _remoteBuild > _localBuild;
+    if (!hasNewer && !isBusy && _state != 'error') {
+      return _buildUpToDateRow(context);
+    }
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
@@ -779,28 +825,7 @@ class _HotUpdateSyncBarState extends State<_HotUpdateSyncBar> {
                     ),
                     if (_myIp.isNotEmpty) ...[
                       const SizedBox(width: 8),
-                      InkWell(
-                        onTap: () {
-                          Clipboard.setData(ClipboardData(text: _myIp));
-                          BotToast.showText(text: '已复制本机局域网 IP: $_myIp');
-                        },
-                        child: Container(
-                          padding: const EdgeInsets.symmetric(
-                              horizontal: 6, vertical: 1),
-                          decoration: BoxDecoration(
-                            color: const Color(0xFF22C55E).withOpacity(0.15),
-                            borderRadius: BorderRadius.circular(4),
-                          ),
-                          child: Text(
-                            '本机 LAN: $_myIp',
-                            style: const TextStyle(
-                              fontSize: 10.5,
-                              fontWeight: FontWeight.w600,
-                              color: Color(0xFF22C55E),
-                            ),
-                          ),
-                        ),
-                      ),
+                      _buildLanChip(),
                     ],
                   ],
                 ),
