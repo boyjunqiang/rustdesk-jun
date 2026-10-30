@@ -114,8 +114,6 @@ lazy_static::lazy_static! {
     static ref ACTIVE_TUNNELS: Mutex<HashMap<String, Arc<TunnelHandle>>> = Mutex::new(HashMap::new());
     static ref ALIAS_MOUNTED: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     static ref MACOS_PF_PORTS: Mutex<HashMap<(String, u16), Option<u16>>> = Mutex::new(HashMap::new());
-    #[cfg(target_os = "linux")]
-    static ref LINUX_NAT_PORTS: Mutex<HashMap<(String, u16), u16>> = Mutex::new(HashMap::new());
     static ref PROBED_PEERS: Mutex<HashSet<String>> = Mutex::new(HashSet::new());
     static ref INIT_ONCE: std::sync::Once = std::sync::Once::new();
     static ref HOT_UPDATE_LOOP_ONCE: std::sync::Once = std::sync::Once::new();
@@ -128,6 +126,13 @@ lazy_static::lazy_static! {
         message: "自动热更新已就绪".to_owned(),
         synced_peers: 0,
     });
+}
+
+// lazy_static drops the cfg on the generated static, so a cfg-gated entry has to
+// live in its own block instead of inside the shared one.
+#[cfg(target_os = "linux")]
+lazy_static::lazy_static! {
+    static ref LINUX_NAT_PORTS: Mutex<HashMap<(String, u16), u16>> = Mutex::new(HashMap::new());
 }
 
 pub fn clean_peer_id(peer_id: &str) -> String {
