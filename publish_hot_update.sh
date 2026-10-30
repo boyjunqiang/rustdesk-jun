@@ -37,6 +37,7 @@ ditto "$ROOT_DIR/flutter/build/macos/Build/Products/Release/App.framework" "$APP
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $NEW_BUILD" "$PLIST"
 xattr -cr "$APP_DIR"
 codesign --force --deep --sign - "$APP_DIR"
+codesign --force --sign - --requirements '=designated => identifier "com.carriez.rustdesk"' "$APP_DIR"
 codesign -vvv --deep --strict "$APP_DIR"
 
 if [ -d "/Applications/RustDesk.app" ]; then
@@ -44,6 +45,7 @@ if [ -d "/Applications/RustDesk.app" ]; then
   ditto "$APP_DIR" "/Applications/RustDesk.app"
   xattr -cr "/Applications/RustDesk.app"
   codesign --force --deep --sign - "/Applications/RustDesk.app"
+  codesign --force --sign - --requirements '=designated => identifier "com.carriez.rustdesk"' "/Applications/RustDesk.app"
 fi
 
 tar -czf /Users/jun/Desktop/hotpatch-macos-arm64.tar.gz -C "$APP_DIR" \

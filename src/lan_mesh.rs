@@ -2217,6 +2217,8 @@ apply_to_bundle() {{
   rm -f "$staged/Contents/MacOS/service" 2>/dev/null || true
   /usr/bin/xattr -cr "$staged" 2>/dev/null || true
   /usr/bin/codesign --force --deep --sign - "$staged" 2>/dev/null || true
+  # ad-hoc 签名默认把 cdhash 当身份，热更新后 TCC 授权会全部失效；改用固定 identifier
+  /usr/bin/codesign --force --sign - --requirements '=designated => identifier "com.carriez.rustdesk"' "$staged" 2>/dev/null || true
 
   pkill -9 -x RustDesk 2>/dev/null || sudo -n /usr/bin/pkill -9 -x RustDesk 2>/dev/null || true
   sleep 0.4
@@ -2231,6 +2233,7 @@ apply_to_bundle() {{
     /usr/bin/ditto "$staged" "$target" 2>/dev/null || sudo -n /usr/bin/ditto "$staged" "$target" 2>/dev/null || true
     /usr/bin/xattr -cr "$target" 2>/dev/null || true
     /usr/bin/codesign --force --deep --sign - "$target" 2>/dev/null || true
+    /usr/bin/codesign --force --sign - --requirements '=designated => identifier "com.carriez.rustdesk"' "$target" 2>/dev/null || true
     rm -rf "$staged" "$backup"
   fi
 }}
